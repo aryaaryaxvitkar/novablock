@@ -1,53 +1,76 @@
 use warp::Filter;
+use serde::Deserialize;
 use std::sync::{Arc, Mutex};
+use ed25519_dalek::{Signature, PublicKey};
+use hex;
 use crate::blockchain::{Blockchain, Transaction};
-use serde::{Deserialize};
 use crate::wallet::verify_transaction;
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct TransactionRequest {
-    sender: String,
-    receiver: String,
+    recipient: String,
     amount: u64,
-    signature: String,
+    sender: String,     // hex encoded public key
+    signature: String,  // hex encoded signature
 }
 
-pub async fn run_server(blockchain: Arc<Mutex<Blockchain>>) {
-    let post_tx = warp::path("transaction")
+pub fn get_routes(blockchain: Arc<Mutex<Blockchain>>) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+    let blockchain_filter = warp::any().map(move || blockchain.clone());
+
+    let chain_route = warp::path("chain")
+        .and(warp::get())
+        .and(blockchain_filter.clone())
+        .map(|blockchain: Arc<Mutex<Blockchain>>| {
+            let chain = blockchain.lock().unwrap().chain.clone();
+            warp::reply::json(&chain)
+        });
+
+    let balance_route = warp::path("balance")
+        .and(warp::get())
+        .and(warp::query::<std::collections::HashMap<String, String>>())
+        .and(blockchain_filter.clone())
+        .map(|params: std::collections::HashMap<String, String>, blockchain: Arc<Mutex<Blockchain>>| {
+            let addr = params.get("address").cloned().unwrap_or_default();
+            let balance = blockchain.lock().unwrap().get_balance(&addr);
+            warp::reply::json(&balance)
+        });
+
+    let tx_route = warp::path("transaction")
         .and(warp::post())
-        .and(with_blockchain(blockchain.clone()))
         .and(warp::body::json())
-        .map(|blockchain: Arc<Mutex<Blockchain>>, tx_req: TransactionRequest| {
+        .and(blockchain_filter.clone())
+        .map(|tx_req: TransactionRequest, blockchain: Arc<Mutex<Blockchain>>| {
+            // Decode hex to raw bytes
+            let signature_bytes = hex::decode(&tx_req.signature).expect("Invalid signature hex");
+            let public_key_bytes = hex::decode(&tx_req.sender).expect("Invalid public key hex");
+
+            // Convert to crypto objects
+            let signature = Signature::from_bytes(&signature_bytes).expect("Invalid signature");
+            let public_key = PublicKey::from_bytes(&public_key_bytes).expect("Invalid public key");
+
+            // Build transaction
             let tx = Transaction {
-                sender: tx_req.sender,
-                receiver: tx_req.receiver,
+                recipient: tx_req.recipient,
                 amount: tx_req.amount,
-                signature: Some(tx_req.signature),
+                sender: public_key.clone(),
+                signature: signature.clone(),
             };
 
-            if verify_transaction(&tx) {
+            // Verify and add to blockchain
+            if verify_transaction(&tx, &signature, &public_key) {
                 blockchain.lock().unwrap().add_transaction(tx);
                 warp::reply::json(&"Transaction added")
             } else {
-                warp::reply::json(&"Invalid transaction")
+                warp::reply::json(&"Invalid transaction signature")
             }
         });
 
-    let get_chain = warp::path("chain")
-        .and(warp::get())
-        .and(with_blockchain(blockchain))
-        .map(|blockchain: Arc<Mutex<Blockchain>>| {
-            let chain = blockchain.lock().unwrap();
-            warp::reply::json(&chain.chain)
-        });
-
-    let routes = post_tx.or(get_chain);
-    warp::serve(routes).run(([127, 0, 0, 1], 8000)).await;
+    chain_route.or(balance_route).or(tx_route)
 }
 
-fn with_blockchain(
-    blockchain: Arc<Mutex<Blockchain>>,
-) -> impl Filter<Extract = (Arc<Mutex<Blockchain>>,), Error = std::convert::Infallible> + Clone {
-    warp::any().map(move || blockchain.clone())
+/// 🔥 This function starts the HTTP server at localhost:3030
+pub async fn start_server(blockchain: Arc<Mutex<Blockchain>>) {
+    let routes = get_routes(blockchain);
+    println!("🌐 HTTP server running on http://127.0.0.1:3030");
+    warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
 }
-
